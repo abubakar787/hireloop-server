@@ -24,6 +24,12 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("hireloopdb");
 const users= database.collection("user");
 const jobs = database.collection("jobs");
+const applications = database.collection("applications")
+
+// Database-level guarantee: one application per person per job. The route
+// checks first for a friendly message; this index is the hard backstop that
+// also closes the race window (two submits at the exact same moment).
+await applications.createIndex({ jobId: 1, email: 1 }, { unique: true });
 
 app.get("/", (req, res) => {
   res.send("Hire loop is running");
@@ -37,9 +43,125 @@ app.get('/users', async (req, res) =>{
     res.send(result);
    
 })
+
+app.get("/jobs/:id", async (req, res) => {
+  const { id } = req.params;
+
+  // Guard against malformed ids so findOne doesn't throw a CastError.
+  if (!ObjectId.isValid(id)) {
+    return res.status(404).send({ message: "Job not found" });
+  }
+
+  const result = await jobs.findOne({ _id: new ObjectId(id) });
+  if (!result) {
+    return res.status(404).send({ message: "Job not found" });
+  }
+
+  res.send(result);
+});
+
+//job application post
+app.post('/applications', async (req, res) => {
+  const { jobId, jobTitle, company, userId, fullName, email } = req.body;
+  if (!jobId || !jobTitle || !company || !userId || !fullName || !email) {
+    return res.status(400).send({
+      message: "jobId, jobTitle, company, userId, fullName and email are required.",
+    });
+  }
+
+  // One application per person per job: reject if this user already
+  // applied to this job (409 = "conflict, already exists").
+  const existing = await applications.findOne({ jobId, userId });
+  if (existing) {
+    return res.status(409).send({ message: "You have already applied for this job." });
+  }
+
+  const doc = {
+    ...req.body,
+    status: "applied",
+    appliedAt: new Date(),
+  };
+  const result = await applications.insertOne(doc);
+  res.status(201).send({ insertedId: result.insertedId });
+});
+
+// Applications for one seeker, newest first — powers the "My
+// Applications" page. Look up by userId (stable) or email (legacy docs
+// saved before userId existed).
+app.get('/applications', async (req, res) => {
+  const { email, userId } = req.query;
+  if (!email && !userId) {
+    return res.status(400).send({ message: "email or userId query param is required." });
+  }
+  const filter = userId
+    ? { $or: [{ userId: String(userId) }, ...(email ? [{ email: String(email) }] : [])] }
+    : { email: String(email) };
+  const docs = await applications
+    .find(filter)
+    .sort({ appliedAt: -1, createdAt: -1 })
+    .toArray();
+
+  // Older documents (saved before jobTitle/company existed on the
+  // application) are enriched from the jobs collection so the dashboard
+  // always has a title + company to display.
+  const missingJobIds = [
+    ...new Set(
+      docs
+        .filter((d) => !d.jobTitle && ObjectId.isValid(d.jobId))
+        .map((d) => d.jobId),
+    ),
+  ];
+  if (missingJobIds.length > 0) {
+    const jobsFound = await jobs
+      .find({ _id: { $in: missingJobIds.map((id) => new ObjectId(id)) } })
+      .toArray();
+    const jobById = new Map(jobsFound.map((j) => [String(j._id), j]));
+    for (const doc of docs) {
+      const job = jobById.get(String(doc.jobId));
+      if (job) {
+        doc.jobTitle = job.title;
+        doc.company = job.company;
+      }
+    }
+  }
+
+  // Legacy documents also predate status/appliedAt — default them so the
+  // API always returns the full shape.
+  for (const doc of docs) {
+    if (!doc.status) doc.status = "applied";
+    if (!doc.appliedAt) doc.appliedAt = doc.createdAt;
+  }
+
+  res.send(docs);
+});
  
 //jobs related apis
 app.get('/jobs', async (req, res) => {
+  const query= {};
+
+  console.log('query:', req.query);
+  if(req.query){
+    if(req.query.jobType){
+      query.type = req.query.jobType;
+    } 
+    if(req.query.isRemote){
+       query.isRemote = req.query.isRemote === 'true';
+    }
+    if(req.query.category){
+      query.category = req.query.category;
+    } 
+    if(req.query.search){
+      const search = req.query.search;
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { responsibilities: { $regex: search, $options: 'i' } },
+        { requirements: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+  }
+
+
     const cursor = jobs.find({});
     const result = await cursor.toArray();
     console.log("Total Jobs:", result.length);
